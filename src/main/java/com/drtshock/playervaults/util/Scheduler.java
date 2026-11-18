@@ -20,11 +20,14 @@ package com.drtshock.playervaults.util;
 
 import com.drtshock.playervaults.PlayerVaults;
 import org.bukkit.Bukkit;
+import org.bukkit.Server;
 import org.bukkit.entity.Entity;
+import org.bukkit.entity.Player;
 import org.bukkit.plugin.Plugin;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -68,6 +71,9 @@ public final class Scheduler {
     private static Method entityRun;
     private static Method entityRunDelayed;
     private static Method scheduledTaskCancel;
+    private static Method globalCancelTasks;
+    private static Method asyncCancelTasks;
+    private static Method isOwnedByCurrentRegion;
 
     static {
         boolean folia;
@@ -112,6 +118,10 @@ public final class Scheduler {
 
         entityRun = entityCls.getMethod("run", Plugin.class, Consumer.class, Runnable.class);
         entityRunDelayed = entityCls.getMethod("runDelayed", Plugin.class, Consumer.class, Runnable.class, long.class);
+
+        globalCancelTasks = globalCls.getMethod("cancelTasks", Plugin.class);
+        asyncCancelTasks = asyncCls.getMethod("cancelTasks", Plugin.class);
+        isOwnedByCurrentRegion = Server.class.getMethod("isOwnedByCurrentRegion", Entity.class);
     }
 
     /**
@@ -192,24 +202,92 @@ public final class Scheduler {
 
     /**
      * Run a task tied to an entity's region. On Folia the task is scheduled through the
-     * entity scheduler (and skipped via {@code retired} if the entity is removed)
+     * entity scheduler, so it runs on whichever region thread currently owns the entity;
      * on Bukkit it runs on the main thread.
+     * <p>
+     * If the entity is removed before the task can run (player logged out, entity despawned),
+     * {@code retired} runs instead. This also happens when the entity is already gone at
+     * scheduling time, so exactly one of {@code runnable} / {@code retired} is always run.
      *
-     * @param entity  the entity to run the task at
+     * @param entity   the entity to run the task at
      * @param runnable what to do
      * @param retired  run if the entity has been removed (nullable)
      */
     public static Task runForEntity(Entity entity, Runnable runnable, Runnable retired) {
         if (FOLIA) {
+            Object task;
             try {
                 Object entityScheduler = entityGetScheduler.invoke(entity);
-                Object task = entityRun.invoke(entityScheduler, plugin(), foliaConsumer(runnable), retired);
-                return task == null ? null : foliaTask(task);
+                task = entityRun.invoke(entityScheduler, plugin(), foliaConsumer(runnable), retired);
+            } catch (InvocationTargetException e) {
+                throw new IllegalStateException("Failed to schedule Folia entity task", e.getCause());
             } catch (Exception e) {
                 throw new IllegalStateException("Failed to schedule Folia entity task", e);
             }
+            if (task == null) {
+                // Folia returns null (and does NOT call 'retired') when the entity is already retired.
+                if (retired != null) {
+                    retired.run();
+                }
+                return null;
+            }
+            return foliaTask(task);
         }
-        return wrap(Bukkit.getScheduler().runTask(plugin(), runnable));
+        return wrap(Bukkit.getScheduler().runTask(plugin(), () -> {
+            boolean alive = entity instanceof Player player ? player.isOnline() : entity.isValid();
+            if (alive) {
+                runnable.run();
+            } else if (retired != null) {
+                retired.run();
+            }
+        }));
+    }
+
+    /**
+     * Run a task on the thread that owns the given entity. If the current thread already owns it
+     * (always true for the main thread on Bukkit), the task is run immediately instead of being
+     * deferred to the next tick.
+     *
+     * @param entity   the entity to run the task at
+     * @param runnable what to do
+     * @param retired  run if the entity has been removed (nullable)
+     */
+    public static void runNowOrForEntity(Entity entity, Runnable runnable, Runnable retired) {
+        if (isOwnedByCurrentThread(entity)) {
+            runnable.run();
+        } else {
+            runForEntity(entity, runnable, retired);
+        }
+    }
+
+    /**
+     * @return whether the current thread may safely touch the given entity.
+     */
+    public static boolean isOwnedByCurrentThread(Entity entity) {
+        if (FOLIA) {
+            try {
+                return (boolean) isOwnedByCurrentRegion.invoke(Bukkit.getServer(), entity);
+            } catch (Exception e) {
+                return false;
+            }
+        }
+        return Bukkit.isPrimaryThread();
+    }
+
+    /**
+     * Cancel every task this plugin has scheduled. Called on disable.
+     */
+    public static void cancelAll() {
+        if (FOLIA) {
+            try {
+                globalCancelTasks.invoke(globalRegionScheduler, plugin());
+                asyncCancelTasks.invoke(asyncScheduler, plugin());
+            } catch (Exception ignored) {
+                // Server is going down anyway
+            }
+            return;
+        }
+        Bukkit.getScheduler().cancelTasks(plugin());
     }
 
     private static Task bukkitTimer(Consumer<Task> body, long delay, long period, boolean async) {
@@ -251,6 +329,8 @@ public final class Scheduler {
         try {
             Object task = method.invoke(scheduler, prepend(plugin(), args));
             return task == null ? null : foliaTask(task);
+        } catch (InvocationTargetException e) {
+            throw new IllegalStateException("Failed to schedule Folia task", e.getCause());
         } catch (Exception e) {
             throw new IllegalStateException("Failed to schedule Folia task", e);
         }

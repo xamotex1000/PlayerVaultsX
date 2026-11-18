@@ -27,7 +27,6 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.RegisteredServiceProvider;
 
-import java.io.File;
 
 /**
  * A class that handles all economy operations.
@@ -123,9 +122,10 @@ public class EconomyOperations {
             return true;
         }
 
-        File playerFile = new File(PlayerVaults.getInstance().getVaultData(), player.getUniqueId().toString() + ".yml");
-        if (playerFile.exists()) {
-            YamlConfiguration playerData = YamlConfiguration.loadConfiguration(playerFile);
+        // Go through VaultManager so we read under its file lock (or from its cache) instead of
+        // possibly reading a file that another thread is in the middle of writing.
+        YamlConfiguration playerData = VaultManager.getInstance().getPlayerVaultFile(player.getUniqueId().toString(), false);
+        if (playerData != null) {
             if (playerData.getString("vault" + number) == null) {
                 PlayerVaults.getInstance().getTL().vaultDoesNotExist().title().send(player);
                 return false;

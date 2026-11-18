@@ -31,8 +31,11 @@ import org.bukkit.inventory.InventoryView;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -52,23 +55,49 @@ public class VaultOperations {
     /**
      * Sets whether or not player vaults are locked. If set to true, this will kick anyone who is currently using their
      * vaults out.
+     * <p>
+     * Safe to call from any thread. Closing vaults happens on each player's own thread, so it may not have
+     * finished when this returns; use {@link #lockAndCloseVaults()} to wait for that.
      *
      * @param locked true for locked, false otherwise
      */
     public static void setLocked(boolean locked) {
-        LOCKED.set(locked);
-
         if (locked) {
-            for (Player player : PlayerVaults.getInstance().getServer().getOnlinePlayers()) {
-                if (player.getOpenInventory() != null) {
-                    InventoryView view = player.getOpenInventory();
-                    if (view.getTopInventory().getHolder() instanceof VaultHolder) {
-                        player.closeInventory();
-                        PlayerVaults.getInstance().getTL().locked().title().send(player);
+            lockAndCloseVaults();
+        } else {
+            LOCKED.set(false);
+        }
+    }
+
+    /**
+     * Locks vaults and closes every open vault, each on its owning player's thread (required on Folia, and
+     * for the main thread on Bukkit).
+     *
+     * @return a future completed once every player who had a vault open has had it closed (and therefore saved)
+     */
+    public static CompletableFuture<Void> lockAndCloseVaults() {
+        LOCKED.set(true);
+        List<CompletableFuture<Void>> closes = new ArrayList<>();
+        for (Player player : PlayerVaults.getInstance().getServer().getOnlinePlayers()) {
+            CompletableFuture<Void> closed = new CompletableFuture<>();
+            closes.add(closed);
+            try {
+                Scheduler.runNowOrForEntity(player, () -> {
+                    try {
+                        InventoryView view = player.getOpenInventory();
+                        if (view != null && view.getTopInventory().getHolder() instanceof VaultHolder) {
+                            player.closeInventory();
+                            PlayerVaults.getInstance().getTL().locked().title().send(player);
+                        }
+                    } finally {
+                        closed.complete(null);
                     }
-                }
+                }, () -> closed.complete(null)); // logged out: the quit listener already saved their vault
+            } catch (RuntimeException e) {
+                closed.completeExceptionally(e);
             }
         }
+        return CompletableFuture.allOf(closes.toArray(new CompletableFuture[0]));
     }
 
     /**
@@ -163,16 +192,15 @@ public class VaultOperations {
                     return false;
                 }
 
+                VaultViewInfo info = new VaultViewInfo(player.getUniqueId().toString(), number);
                 player.openInventory(inv);
 
                 // Check if the inventory was actually opened
                 if (player.getOpenInventory().getTopInventory() instanceof CraftingInventory || player.getOpenInventory().getTopInventory() == null) {
                     PlayerVaults.debug(String.format("Cancelled opening vault %s for %s from an outside source.", arg, player.getName()));
+                    VaultManager.getInstance().discardIfUnviewed(info, inv);
                     return false; // inventory open event was cancelled.
                 }
-
-                VaultViewInfo info = new VaultViewInfo(player.getUniqueId().toString(), number);
-                PlayerVaults.getInstance().getOpenInventories().put(info.toString(), inv);
 
                 if (send) {
                     PlayerVaults.getInstance().getTL().openVault().title().with("vault", arg).send(player);
@@ -236,6 +264,7 @@ public class VaultOperations {
             }
         } catch (NumberFormatException nfe) {
             PlayerVaults.getInstance().getTL().mustBeNumber().title().send(player);
+            return false;
         }
 
         Inventory inv = VaultManager.getInstance().loadOtherVault(vaultOwner, number, getMaxVaultSize(vaultOwner));
@@ -255,6 +284,7 @@ public class VaultOperations {
             // Check if the inventory was actually opened
             if (player.getOpenInventory().getTopInventory() instanceof CraftingInventory || player.getOpenInventory().getTopInventory() == null) {
                 PlayerVaults.debug(String.format("Cancelled opening vault %s for %s from an outside source.", arg, player.getName()));
+                VaultManager.getInstance().discardIfUnviewed(new VaultViewInfo(vaultOwner, number), inv);
                 return false; // inventory open event was cancelled.
             }
             if (send) {
@@ -370,14 +400,14 @@ public class VaultOperations {
     private record PlayerCount(int count, Instant time) {
     }
 
-    private static Map<UUID, PlayerCount> countCache = new ConcurrentHashMap<>();
+    private static final Map<UUID, PlayerCount> countCache = new ConcurrentHashMap<>();
 
     private static final int secondsToLive = 2;
 
     public static int countVaults(Player player) {
         UUID uuid = player.getUniqueId();
         PlayerCount count = countCache.get(uuid);
-        if (count != null && count.time().isAfter(Instant.now().plus(secondsToLive, ChronoUnit.SECONDS))) {
+        if (count != null && count.time().plus(secondsToLive, ChronoUnit.SECONDS).isAfter(Instant.now())) {
             return count.count;
         }
         int vaultCount = 0;
@@ -389,9 +419,7 @@ public class VaultOperations {
         PlayerCount newCount = new PlayerCount(vaultCount, Instant.now());
         countCache.put(uuid, newCount);
         Scheduler.runLaterAsync(() -> {
-            if (countCache.get(uuid) == newCount) {
-                countCache.remove(uuid); // Do a lil cleanup to avoid the world's smallest memory leak
-            }
+            countCache.remove(uuid, newCount); // Do a lil cleanup to avoid the world's smallest memory leak
         }, 20 * secondsToLive + 1);
         return vaultCount;
     }

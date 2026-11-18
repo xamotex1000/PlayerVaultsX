@@ -77,15 +77,19 @@ public class Listeners implements Listener {
             inv.setContents(inventory.getContents().clone());
 
             PlayerVaults.debug(inventory.getType() + " " + inventory.getClass().getSimpleName());
+            // Always persist on close. Previously only the last viewer saved, but on Folia two viewers in
+            // different regions can close at the same moment, each still see the other as a viewer, and
+            // neither would save. Saving the shared inventory from every closer is always correct.
+            PlayerVaults.debug("Saving!");
+            vaultManager.saveVault(inv, info.getVaultName(), info.getNumber());
             if (inventory.getViewers().size() <= 1) {
-                PlayerVaults.debug("Saving!");
-                vaultManager.saveVault(inv, info.getVaultName(), info.getNumber());
-                plugin.getOpenInventories().remove(info.toString());
+                // Only drop the shared copy if it's still the one registered for this vault.
+                plugin.getOpenInventories().remove(info.toString(), inventory);
             } else {
                 if (badDay) {
                     PlayerVaults.getInstance().getLogger().severe("Viewers size >0: " + inventory.getViewers().stream().map(HumanEntity::getName).collect(Collectors.joining(", ")));
                 }
-                PlayerVaults.debug("Other viewers found, not saving! " + inventory.getViewers().stream().map(HumanEntity::getName).collect(Collectors.joining(" ")));
+                PlayerVaults.debug("Other viewers found, keeping shared vault open: " + inventory.getViewers().stream().map(HumanEntity::getName).collect(Collectors.joining(" ")));
             }
         }
     }

@@ -22,6 +22,7 @@ import com.drtshock.playervaults.PlayerVaults;
 import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.Inventory;
@@ -41,13 +42,30 @@ import java.util.logging.Level;
 public class VaultManager {
 
     private static final String VAULTKEY = "vault%d";
+    private static final int LOCK_STRIPES = 64;
     private static VaultManager instance;
     private final File directory = PlayerVaults.getInstance().getVaultData();
+    /*
+     * Cached vault files. Entries in this map are treated as immutable once published: every
+     * modification is made on a copy which then replaces the cached entry. That lets threads read
+     * a cached file without holding a lock while another thread (another Folia region, or an async
+     * task) is saving to the same holder.
+     */
     private final Map<String, YamlConfiguration> cachedVaultFiles = new ConcurrentHashMap<>();
+    /*
+     * Striped locks guarding all disk access (and cache updates) for a holder's file. Without them,
+     * two threads saving different vaults of the same holder can each load the file, modify their
+     * own vault and write back, silently discarding the other's change; or a reader can load a
+     * half-written file.
+     */
+    private final Object[] fileLocks = new Object[LOCK_STRIPES];
     private final PlayerVaults plugin;
 
     public VaultManager(PlayerVaults plugin) {
         this.plugin = plugin;
+        for (int i = 0; i < LOCK_STRIPES; i++) {
+            this.fileLocks[i] = new Object();
+        }
         instance = this;
     }
 
@@ -60,6 +78,10 @@ public class VaultManager {
         return instance;
     }
 
+    private Object lockFor(String holder) {
+        return this.fileLocks[(holder.hashCode() & 0x7fffffff) % LOCK_STRIPES];
+    }
+
     /**
      * Saves the inventory to the specified player and vault number.
      *
@@ -68,11 +90,13 @@ public class VaultManager {
      * @param number The vault number.
      */
     public void saveVault(Inventory inventory, String target, int number) {
-        YamlConfiguration yaml = getPlayerVaultFile(target, true);
-        int size = VaultOperations.getMaxVaultSize(target);
+        // Serialize on the calling thread (which owns the inventory), outside the file lock.
         String serialized = CardboardBoxSerialization.toStorage(inventory, target);
-        yaml.set(String.format(VAULTKEY, number), serialized);
-        saveFileSync(target, yaml);
+        synchronized (lockFor(target)) {
+            YamlConfiguration yaml = copyOf(getPlayerVaultFile(target, true));
+            yaml.set(String.format(VAULTKEY, number), serialized);
+            saveFileSync(target, yaml);
+        }
     }
 
     /**
@@ -90,21 +114,23 @@ public class VaultManager {
 
         String title = PlayerVaults.getInstance().getVaultTitle(String.valueOf(number));
         VaultViewInfo info = new VaultViewInfo(player.getUniqueId().toString(), number);
-        if (PlayerVaults.getInstance().getOpenInventories().containsKey(info.toString())) {
+        Inventory open = PlayerVaults.getInstance().getOpenInventories().get(info.toString());
+        if (open != null) {
             PlayerVaults.debug("Already open");
-            return PlayerVaults.getInstance().getOpenInventories().get(info.toString());
+            return open;
         }
 
         YamlConfiguration playerFile = getPlayerVaultFile(player.getUniqueId().toString(), true);
         VaultHolder vaultHolder = new VaultHolder(number);
+        Inventory inv;
         if (playerFile.getString(String.format(VAULTKEY, number)) == null) {
             PlayerVaults.debug("No vault matching number");
-            Inventory inv = Bukkit.createInventory(vaultHolder, size, title);
-            vaultHolder.setInventory(inv);
-            return inv;
+            inv = Bukkit.createInventory(vaultHolder, size, title);
         } else {
-            return getInventory(vaultHolder, player.getUniqueId().toString(), playerFile, size, number, title);
+            inv = getInventory(vaultHolder, player.getUniqueId().toString(), playerFile, size, number, title);
         }
+        vaultHolder.setInventory(inv);
+        return publishOpenInventory(info, inv);
     }
 
     /**
@@ -132,22 +158,47 @@ public class VaultManager {
 
         String title = PlayerVaults.getInstance().getVaultTitle(String.valueOf(number));
         VaultViewInfo info = new VaultViewInfo(name, number);
-        Inventory inv;
-        VaultHolder vaultHolder = new VaultHolder(number);
-        if (PlayerVaults.getInstance().getOpenInventories().containsKey(info.toString())) {
+        Inventory open = PlayerVaults.getInstance().getOpenInventories().get(info.toString());
+        if (open != null) {
             PlayerVaults.debug("Already open");
-            inv = PlayerVaults.getInstance().getOpenInventories().get(info.toString());
-        } else {
-            YamlConfiguration playerFile = getPlayerVaultFile(holder, true);
-            Inventory i = getInventory(vaultHolder, holder, playerFile, size, number, title);
-            if (i == null) {
-                return null;
-            } else {
-                inv = i;
-            }
-            PlayerVaults.getInstance().getOpenInventories().put(info.toString(), inv);
+            return open;
+        }
+        YamlConfiguration playerFile = getPlayerVaultFile(holder, true);
+        VaultHolder vaultHolder = new VaultHolder(number);
+        Inventory inv = getInventory(vaultHolder, holder, playerFile, size, number, title);
+        if (inv == null) {
+            return null;
+        }
+        vaultHolder.setInventory(inv);
+        return publishOpenInventory(info, inv);
+    }
+
+    /**
+     * Registers a freshly loaded vault inventory as the shared open copy, unless another thread beat
+     * us to it, in which case that thread's copy wins and is returned. This guarantees everyone
+     * viewing a given vault sees the same Inventory object (otherwise two concurrent openers on
+     * different Folia regions would each get their own copy and the last one closed would overwrite
+     * the other's changes).
+     */
+    private Inventory publishOpenInventory(VaultViewInfo info, Inventory inv) {
+        Inventory existing = PlayerVaults.getInstance().getOpenInventories().putIfAbsent(info.toString(), inv);
+        if (existing != null) {
+            PlayerVaults.debug("Already open (concurrently)");
+            return existing;
         }
         return inv;
+    }
+
+    /**
+     * Forget a shared open vault inventory if nobody ended up viewing it (e.g. the open was cancelled).
+     *
+     * @param info the vault
+     * @param inventory the inventory that was registered for it
+     */
+    void discardIfUnviewed(VaultViewInfo info, Inventory inventory) {
+        if (inventory.getViewers().isEmpty()) {
+            PlayerVaults.getInstance().getOpenInventories().remove(info.toString(), inventory);
+        }
     }
 
     /**
@@ -246,8 +297,10 @@ public class VaultManager {
     }
 
     public void deleteAllVaults(String holder) {
-        removeCachedPlayerVaultFile(holder);
-        deletePlayerVaultFile(holder);
+        synchronized (lockFor(holder)) {
+            removeCachedPlayerVaultFile(holder);
+            deletePlayerVaultFile(holder);
+        }
     }
 
     /**
@@ -258,18 +311,35 @@ public class VaultManager {
      * @param number The vault number.
      */
     public void deleteVault(CommandSender sender, final String holder, final int number) {
-        Scheduler.runAsync(() -> {
-            File file = new File(directory, holder + ".yml");
-            if (!file.exists()) {
-                return;
-            }
+        final String key = String.format(VAULTKEY, number);
 
-            YamlConfiguration playerFile = YamlConfiguration.loadConfiguration(file);
-            if (file.exists()) {
-                playerFile.set(String.format(VAULTKEY, number), null);
-                if (cachedVaultFiles.containsKey(holder)) {
-                    cachedVaultFiles.put(holder, playerFile);
+        // Update the in-memory copy right away, so a reopen before the disk write finishes doesn't
+        // resurrect the deleted contents.
+        synchronized (lockFor(holder)) {
+            YamlConfiguration cached = cachedVaultFiles.get(holder);
+            if (cached != null && cached.contains(key)) {
+                YamlConfiguration updated = copyOf(cached);
+                updated.set(key, null);
+                cachedVaultFiles.put(holder, updated);
+            }
+        }
+
+        Scheduler.runAsync(() -> {
+            synchronized (lockFor(holder)) {
+                File file = new File(directory, holder + ".yml");
+                if (!file.exists()) {
+                    return;
                 }
+
+                // Re-read the current state while holding the lock, so a save that happened after
+                // this task was scheduled is not overwritten with stale data.
+                YamlConfiguration current = getPlayerVaultFile(holder, false);
+                if (current == null) {
+                    return;
+                }
+                YamlConfiguration playerFile = copyOf(current);
+                playerFile.set(key, null);
+                cachedVaultFiles.replace(holder, playerFile);
                 try {
                     playerFile.save(file);
                 } catch (IOException ignored) {
@@ -286,15 +356,17 @@ public class VaultManager {
             }
         }
 
-        String vaultName = sender instanceof Player ? ((Player) sender).getUniqueId().toString() : holder;
-        PlayerVaults.getInstance().getOpenInventories().remove(new VaultViewInfo(vaultName, number).toString());
+        // Drop the shared open copy for the vault that was deleted (the holder's, not the sender's).
+        PlayerVaults.getInstance().getOpenInventories().remove(new VaultViewInfo(holder, number).toString());
     }
 
     // Should only be run asynchronously
     public void cachePlayerVaultFile(String holder) {
-        YamlConfiguration config = this.loadPlayerVaultFile(holder, false);
-        if (config != null) {
-            this.cachedVaultFiles.put(holder, config);
+        synchronized (lockFor(holder)) {
+            YamlConfiguration config = this.loadPlayerVaultFile(holder, false);
+            if (config != null) {
+                this.cachedVaultFiles.put(holder, config);
+            }
         }
     }
 
@@ -304,15 +376,25 @@ public class VaultManager {
 
     /**
      * Get the holder's vault file. Create if doesn't exist.
+     * <p>
+     * The returned configuration may be shared with other threads; do not modify it. Copy it, modify
+     * the copy and pass it to {@link #saveFileSync(String, YamlConfiguration)} instead.
      *
      * @param holder The vault holder.
      * @return The holder's vault config file.
      */
     public YamlConfiguration getPlayerVaultFile(String holder, boolean createIfNotFound) {
-        if (cachedVaultFiles.containsKey(holder)) {
-            return cachedVaultFiles.get(holder);
+        YamlConfiguration cached = cachedVaultFiles.get(holder);
+        if (cached != null) {
+            return cached;
         }
-        return loadPlayerVaultFile(holder, createIfNotFound);
+        synchronized (lockFor(holder)) {
+            cached = cachedVaultFiles.get(holder);
+            if (cached != null) {
+                return cached;
+            }
+            return loadPlayerVaultFile(holder, createIfNotFound);
+        }
     }
 
     public YamlConfiguration loadPlayerVaultFile(String holder) {
@@ -325,50 +407,93 @@ public class VaultManager {
      * @param holder UUID of the holder.
      */
     public void deletePlayerVaultFile(String holder) {
-        File file = new File(this.directory, holder + ".yml");
-        if (file.exists()) {
-            file.delete();
+        synchronized (lockFor(holder)) {
+            File file = new File(this.directory, holder + ".yml");
+            if (file.exists()) {
+                file.delete();
+            }
+        }
+    }
+
+    /**
+     * Deletes a vault file if it hasn't been modified since the given time. The check and the
+     * delete happen under the holder's lock so a vault saved in the meantime isn't purged.
+     *
+     * @param file the vault file
+     * @param cutoff epoch millis; files last modified before this are deleted
+     * @return true if the file was deleted
+     */
+    public boolean deleteVaultFileIfOlderThan(File file, long cutoff) {
+        String name = file.getName();
+        String holder = name.endsWith(".yml") ? name.substring(0, name.length() - 4) : name;
+        synchronized (lockFor(holder)) {
+            if (!file.exists() || file.lastModified() >= cutoff) {
+                return false;
+            }
+            removeCachedPlayerVaultFile(holder);
+            return file.delete();
         }
     }
 
     public YamlConfiguration loadPlayerVaultFile(String uniqueId, boolean createIfNotFound) {
-        if (!this.directory.exists()) {
-            this.directory.mkdir();
-        }
-
-        File file = new File(this.directory, uniqueId + ".yml");
-        if (!file.exists()) {
-            if (createIfNotFound) {
-                try {
-                    file.createNewFile();
-                } catch (IOException e) {
-                    e.printStackTrace();
-                }
-            } else {
-                return null;
+        synchronized (lockFor(uniqueId)) {
+            if (!this.directory.exists()) {
+                this.directory.mkdir();
             }
-        }
 
-        return YamlConfiguration.loadConfiguration(file);
+            File file = new File(this.directory, uniqueId + ".yml");
+            if (!file.exists()) {
+                if (createIfNotFound) {
+                    try {
+                        file.createNewFile();
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                } else {
+                    return null;
+                }
+            }
+
+            return YamlConfiguration.loadConfiguration(file);
+        }
     }
 
     public void saveFileSync(final String holder, final YamlConfiguration yaml) {
-        if (cachedVaultFiles.containsKey(holder)) {
-            cachedVaultFiles.put(holder, yaml);
-        }
+        synchronized (lockFor(holder)) {
+            cachedVaultFiles.replace(holder, yaml);
 
-        final boolean backups = PlayerVaults.getInstance().isBackupsEnabled();
-        final File backupsFolder = PlayerVaults.getInstance().getBackupsFolder();
-        final File file = new File(directory, holder + ".yml");
-        if (file.exists() && backups) {
-            file.renameTo(new File(backupsFolder, holder + ".yml"));
-        }
-        try {
-            yaml.save(file);
-        } catch (IOException e) {
-            PlayerVaults.getInstance().addException(new IllegalStateException("Failed to save vault file for: " + holder, e));
-            PlayerVaults.getInstance().getLogger().log(Level.SEVERE, "Failed to save vault file for: " + holder, e);
+            final boolean backups = PlayerVaults.getInstance().isBackupsEnabled();
+            final File backupsFolder = PlayerVaults.getInstance().getBackupsFolder();
+            final File file = new File(directory, holder + ".yml");
+            if (file.exists() && backups) {
+                file.renameTo(new File(backupsFolder, holder + ".yml"));
+            }
+            try {
+                yaml.save(file);
+            } catch (IOException e) {
+                PlayerVaults.getInstance().addException(new IllegalStateException("Failed to save vault file for: " + holder, e));
+                PlayerVaults.getInstance().getLogger().log(Level.SEVERE, "Failed to save vault file for: " + holder, e);
+            }
         }
         PlayerVaults.debug("Saved vault for " + holder);
+    }
+
+    private static YamlConfiguration copyOf(YamlConfiguration source) {
+        YamlConfiguration copy = new YamlConfiguration();
+        if (source != null) {
+            copyInto(source, copy);
+        }
+        return copy;
+    }
+
+    private static void copyInto(ConfigurationSection from, ConfigurationSection to) {
+        for (String key : from.getKeys(false)) {
+            Object value = from.get(key);
+            if (value instanceof ConfigurationSection section) {
+                copyInto(section, to.createSection(key));
+            } else {
+                to.set(key, value);
+            }
+        }
     }
 }

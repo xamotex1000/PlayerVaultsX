@@ -19,6 +19,7 @@
 package com.drtshock.playervaults.tasks;
 
 import com.drtshock.playervaults.PlayerVaults;
+import com.drtshock.playervaults.vaultmanagement.VaultManager;
 
 import java.io.File;
 
@@ -38,14 +39,18 @@ public class Cleanup implements Runnable {
             return;
         }
 
-        long time = System.currentTimeMillis();
-        for (File file : directory.listFiles()) {
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return;
+        }
+        long cutoff = System.currentTimeMillis() - diff;
+        for (File file : files) {
             if (file.isDirectory()) {
                 continue;
             }
-            if (time - file.lastModified() > diff) {
-                PlayerVaults.getInstance().getLogger().info("Deleting vault file (cleanup): " + file.getName());
-                file.delete();
+            // Check-and-delete under the vault file's lock, so a vault saved while this runs isn't purged.
+            if (VaultManager.getInstance().deleteVaultFileIfOlderThan(file, cutoff)) {
+                PlayerVaults.getInstance().getLogger().info("Deleted vault file (cleanup): " + file.getName());
             }
         }
     }

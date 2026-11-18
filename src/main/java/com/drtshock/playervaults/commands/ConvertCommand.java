@@ -29,6 +29,10 @@ import org.bukkit.command.CommandSender;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.logging.Level;
 
 public class ConvertCommand implements CommandExecutor {
 
@@ -75,13 +79,27 @@ public class ConvertCommand implements CommandExecutor {
                     this.plugin.getTL().convertBackground().title().send(sender);
                     Scheduler.runLaterAsync(() -> {
                         int converted = 0;
-                        VaultOperations.setLocked(true);
-                        for (Converter converter : applicableConverters) {
-                            if (converter.canConvert()) {
-                                converted += converter.run(sender);
+                        try {
+                            // Kick everyone out of their vaults (on their own threads) and wait for those
+                            // closes - and the saves they trigger - to finish before touching vault files.
+                            try {
+                                VaultOperations.lockAndCloseVaults().get(10, TimeUnit.SECONDS);
+                            } catch (TimeoutException e) {
+                                this.plugin.getLogger().warning("Timed out waiting for open vaults to close before converting; continuing anyway.");
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                return;
+                            } catch (ExecutionException e) {
+                                this.plugin.getLogger().log(Level.WARNING, "Failed to close some open vaults before converting", e.getCause());
                             }
+                            for (Converter converter : applicableConverters) {
+                                if (converter.canConvert()) {
+                                    converted += converter.run(sender);
+                                }
+                            }
+                        } finally {
+                            VaultOperations.setLocked(false);
                         }
-                        VaultOperations.setLocked(false);
                         this.plugin.getTL().convertComplete().title().with("count", converted + "").send(sender);
                     }, 5);
                 }

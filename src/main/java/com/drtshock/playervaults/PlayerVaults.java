@@ -80,6 +80,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -87,7 +88,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.regex.Pattern;
@@ -96,19 +99,25 @@ import java.util.stream.Collectors;
 public class PlayerVaults extends JavaPlugin {
     public static boolean DEBUG;
     private static PlayerVaults instance;
-    private final HashMap<String, SignSetInfo> setSign = new HashMap<>();
+    // These maps are touched from every player's region thread on Folia (and from async tasks), so they must be concurrent.
+    private final Map<String, SignSetInfo> setSign = new ConcurrentHashMap<>();
     // Player name - VaultViewInfo
-    private final HashMap<String, VaultViewInfo> inVault = new HashMap<>();
+    private final Map<String, VaultViewInfo> inVault = new ConcurrentHashMap<>();
     // VaultViewInfo - Inventory
-    private final HashMap<String, Inventory> openInventories = new HashMap<>();
-    private final Set<Material> blockedMats = new HashSet<>();
-    private final Set<Enchantment> blockedEnchs = new HashSet<>();
-    private boolean blockWithModelData = false;
-    private boolean blockWithoutModelData = false;
+    private final Map<String, Inventory> openInventories = new ConcurrentHashMap<>();
+    // Replaced wholesale on reload (never mutated after publishing) so readers on other threads never see a half-built set.
+    private volatile Set<Material> blockedMats = Collections.emptySet();
+    private volatile Set<Enchantment> blockedEnchs = Collections.emptySet();
+    private volatile boolean blockWithModelData = false;
+    private volatile boolean blockWithoutModelData = false;
     private boolean useVault;
+    // Guards all access to the signs config, which is read and written from many region threads on Folia.
+    private final Object signsLock = new Object();
+    // Serializes disk access to signs.yml. Lock order: signsFileWriteLock, then signsLock.
+    private final Object signsFileWriteLock = new Object();
     private YamlConfiguration signs;
     private File signsFile;
-    private boolean saveQueued;
+    private final AtomicBoolean saveQueued = new AtomicBoolean();
     private boolean backupsEnabled;
     private File backupsFolder;
     private File uuidData;
@@ -120,7 +129,7 @@ public class PlayerVaults extends JavaPlugin {
     private final Translation translation = new Translation(this);
     private final List<String> exceptions = new CopyOnWriteArrayList<>();
     private String updateCheck;
-    private Response updateResponse;
+    private volatile Response updateResponse;
 
     public static PlayerVaults getInstance() {
         return instance;
@@ -189,8 +198,9 @@ public class PlayerVaults extends JavaPlugin {
             Scheduler.runAsync(new Cleanup(getConf().getPurge().getDaysSinceLastEdit()));
         }
 
-        Scheduler.runTimer(task -> {
-            if (saveQueued) {
+        // Disk IO doesn't belong on a tick thread; snapshotting happens under the signs lock.
+        Scheduler.runTimerAsync(task -> {
+            if (saveQueued.get()) {
                 saveSignsFile();
             }
         }, 20, 20);
@@ -371,7 +381,9 @@ public class PlayerVaults extends JavaPlugin {
             }
         }
 
-        if (getConf().getPurge().isEnabled()) {
+        Scheduler.cancelAll();
+        // Flush any sign changes made since the last periodic save.
+        if (saveQueued.get()) {
             saveSignsFile();
         }
     }
@@ -405,18 +417,19 @@ public class PlayerVaults extends JavaPlugin {
             this.getLogger().log(Level.SEVERE, "Could not load config.", e);
         }
 
-        // Clear just in case this is a reload.
-        blockedMats.clear();
-        blockedEnchs.clear();
-        this.blockWithModelData = false;
-        this.blockWithoutModelData = false;
+        // Build fresh sets (this may be a reload) and publish them at the end, so listeners running on
+        // other threads keep using the old values until the new ones are complete.
+        Set<Material> blockedMats = new HashSet<>();
+        Set<Enchantment> blockedEnchs = new HashSet<>();
+        boolean blockWithModelData = false;
+        boolean blockWithoutModelData = false;
         if (getConf().getItemBlocking().isEnabled()) {
             for (String s : getConf().getItemBlocking().getList()) {
                 if (s.equalsIgnoreCase("BLOCK_ALL_WITH_CUSTOM_MODEL_DATA")) {
-                    this.blockWithModelData = true;
+                    blockWithModelData = true;
                 }
                 if (s.equalsIgnoreCase("BLOCK_ALL_WITHOUT_CUSTOM_MODEL_DATA")) {
-                    this.blockWithoutModelData = true;
+                    blockWithoutModelData = true;
                 }
                 Material mat = Material.matchMaterial(s);
                 if (mat != null) {
@@ -441,9 +454,13 @@ public class PlayerVaults extends JavaPlugin {
         try {
             ItemMeta.class.getMethod("hasCustomModelData");
         } catch (NoSuchMethodException e) {
-            this.blockWithModelData = false;
-            this.blockWithoutModelData = false;
+            blockWithModelData = false;
+            blockWithoutModelData = false;
         }
+        this.blockedMats = Collections.unmodifiableSet(blockedMats);
+        this.blockedEnchs = Collections.unmodifiableSet(blockedEnchs);
+        this.blockWithModelData = blockWithModelData;
+        this.blockWithoutModelData = blockWithoutModelData;
 
         File lang = new File(this.getDataFolder(), "lang");
         if (lang.exists()) {
@@ -477,36 +494,44 @@ public class PlayerVaults extends JavaPlugin {
     }
 
     private void loadSigns() {
-        File signs = new File(getDataFolder(), "signs.yml");
-        if (!signs.exists()) {
-            try {
-                signs.createNewFile();
-            } catch (IOException e) {
-                getLogger().severe("PlayerVaults has encountered a fatal error trying to load the signs file.");
-                getLogger().severe("Please report this error on GitHub @ https://github.com/drtshock/PlayerVaults/");
-                e.printStackTrace();
+        synchronized (this.signsLock) {
+            File signs = new File(getDataFolder(), "signs.yml");
+            if (!signs.exists()) {
+                try {
+                    signs.createNewFile();
+                } catch (IOException e) {
+                    getLogger().severe("PlayerVaults has encountered a fatal error trying to load the signs file.");
+                    getLogger().severe("Please report this error on GitHub @ https://github.com/drtshock/PlayerVaults/");
+                    e.printStackTrace();
+                }
             }
+            this.signsFile = signs;
+            this.signs = YamlConfiguration.loadConfiguration(signs);
         }
-        this.signsFile = signs;
-        this.signs = YamlConfiguration.loadConfiguration(signs);
     }
 
     private void reloadSigns() {
         if (!getConf().isSigns()) {
             return;
         }
-        if (!signsFile.exists()) loadSigns();
-        try {
-            signs.load(signsFile);
-        } catch (IOException | InvalidConfigurationException e) {
-            getLogger().severe("PlayerVaults has encountered a fatal error trying to reload the signs file.");
-            getLogger().severe("Please report this error on GitHub @ https://github.com/drtshock/PlayerVaults/");
-            e.printStackTrace();
+        synchronized (this.signsFileWriteLock) {
+            synchronized (this.signsLock) {
+                if (!signsFile.exists()) loadSigns();
+                try {
+                    signs.load(signsFile);
+                } catch (IOException | InvalidConfigurationException e) {
+                    getLogger().severe("PlayerVaults has encountered a fatal error trying to reload the signs file.");
+                    getLogger().severe("Please report this error on GitHub @ https://github.com/drtshock/PlayerVaults/");
+                    e.printStackTrace();
+                }
+            }
         }
     }
 
     /**
      * Get the signs.yml config.
+     * <p>
+     * This is accessed from multiple threads on Folia: hold {@link #getSignsLock()} while reading or writing it.
      *
      * @return The signs.yml config.
      */
@@ -515,10 +540,17 @@ public class PlayerVaults extends JavaPlugin {
     }
 
     /**
+     * @return the lock that must be held while using {@link #getSigns()}
+     */
+    public Object getSignsLock() {
+        return this.signsLock;
+    }
+
+    /**
      * Save the signs.yml file.
      */
     public void saveSigns() {
-        saveQueued = true;
+        saveQueued.set(true);
     }
 
     private void saveSignsFile() {
@@ -526,25 +558,36 @@ public class PlayerVaults extends JavaPlugin {
             return;
         }
 
-        saveQueued = false;
-        try {
-            signs.save(this.signsFile);
-        } catch (IOException e) {
-            getLogger().severe("PlayerVaults has encountered an error trying to save the signs file.");
-            getLogger().severe("Please report this error on GitHub @ https://github.com/drtshock/PlayerVaults/");
-            e.printStackTrace();
+        // Snapshot and write under one lock so two saves (the async timer and onDisable) can't write
+        // their snapshots out of order.
+        synchronized (this.signsFileWriteLock) {
+            // Clear the flag before snapshotting: a change made after the snapshot re-queues a save.
+            saveQueued.set(false);
+            String data;
+            File file;
+            synchronized (this.signsLock) {
+                data = this.signs.saveToString();
+                file = this.signsFile;
+            }
+            try {
+                Files.write(file.toPath(), data.getBytes(StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                getLogger().severe("PlayerVaults has encountered an error trying to save the signs file.");
+                getLogger().severe("Please report this error on GitHub @ https://github.com/drtshock/PlayerVaults/");
+                e.printStackTrace();
+            }
         }
     }
 
-    public HashMap<String, SignSetInfo> getSetSign() {
+    public Map<String, SignSetInfo> getSetSign() {
         return this.setSign;
     }
 
-    public HashMap<String, VaultViewInfo> getInVault() {
+    public Map<String, VaultViewInfo> getInVault() {
         return this.inVault;
     }
 
-    public HashMap<String, Inventory> getOpenInventories() {
+    public Map<String, Inventory> getOpenInventories() {
         return this.openInventories;
     }
 
@@ -725,16 +768,17 @@ public class PlayerVaults extends JavaPlugin {
         }
     }
 
-    private final Set<UUID> told = new HashSet<>();
+    // Written from join events on every region thread and from the async update checker.
+    private final Set<UUID> told = ConcurrentHashMap.newKeySet();
 
     public void updateNotification(Player player) {
+        Response updateResponse = this.updateResponse;
         if (updateResponse == null || !player.hasPermission(Permission.ADMIN)) {
             return;
         }
-        if (!updateResponse.isUrgent() && this.told.contains(player.getUniqueId())) {
+        if (!this.told.add(player.getUniqueId()) && !updateResponse.isUrgent()) {
             return;
         }
-        this.told.add(player.getUniqueId());
         ComponentDispatcher.send(player, Component.text().color(TextColor.fromHexString("#e35959"))
                 .content("PlayerVaultsX Update Available: " + updateResponse.getLatestVersion()));
         if (updateResponse.isUrgent()) {

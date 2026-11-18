@@ -19,6 +19,7 @@
 package com.drtshock.playervaults.listeners;
 
 import com.drtshock.playervaults.PlayerVaults;
+import com.drtshock.playervaults.commands.SignSetInfo;
 import com.drtshock.playervaults.util.Permission;
 import com.drtshock.playervaults.vaultmanagement.VaultOperations;
 import com.drtshock.playervaults.vaultmanagement.VaultViewInfo;
@@ -67,11 +68,11 @@ public class SignListener implements Listener {
                 }
             }
         }
-        if (PlayerVaults.getInstance().getSetSign().containsKey(player.getName())) {
-            int i = PlayerVaults.getInstance().getSetSign().get(player.getName()).getChest();
-            boolean self = PlayerVaults.getInstance().getSetSign().get(player.getName()).isSelf();
-            String owner = self ? null : PlayerVaults.getInstance().getSetSign().get(player.getName()).getOwner();
-            PlayerVaults.getInstance().getSetSign().remove(player.getName());
+        SignSetInfo setInfo = PlayerVaults.getInstance().getSetSign().remove(player.getName());
+        if (setInfo != null) {
+            int i = setInfo.getChest();
+            boolean self = setInfo.isSelf();
+            String owner = self ? null : setInfo.getOwner();
             event.setCancelled(true);
             if (event.getAction() == Action.RIGHT_CLICK_BLOCK || event.getAction() == Action.LEFT_CLICK_BLOCK) {
                 if (block != null && plugin.isSign(block.getType())) {
@@ -81,12 +82,14 @@ public class SignListener implements Listener {
                     int x = l.getBlockX();
                     int y = l.getBlockY();
                     int z = l.getBlockZ();
-                    if (self) {
-                        plugin.getSigns().set(world + ";;" + x + ";;" + y + ";;" + z + ".self", true);
-                    } else {
-                        plugin.getSigns().set(world + ";;" + x + ";;" + y + ";;" + z + ".owner", owner);
+                    synchronized (plugin.getSignsLock()) {
+                        if (self) {
+                            plugin.getSigns().set(world + ";;" + x + ";;" + y + ";;" + z + ".self", true);
+                        } else {
+                            plugin.getSigns().set(world + ";;" + x + ";;" + y + ";;" + z + ".owner", owner);
+                        }
+                        plugin.getSigns().set(world + ";;" + x + ";;" + y + ";;" + z + ".chest", i);
                     }
-                    plugin.getSigns().set(world + ";;" + x + ";;" + y + ";;" + z + ".chest", i);
                     plugin.saveSigns();
                     this.plugin.getTL().setSign().title().send(player);
                 } else {
@@ -104,18 +107,30 @@ public class SignListener implements Listener {
                 int x = l.getBlockX();
                 int y = l.getBlockY();
                 int z = l.getBlockZ();
-                if (plugin.getSigns().getKeys(false).contains(world + ";;" + x + ";;" + y + ";;" + z)) {
+                String key = world + ";;" + x + ";;" + y + ";;" + z;
+                // Copy what we need out of the shared signs config while holding its lock.
+                boolean isVaultSign;
+                int num = 1;
+                boolean self = false;
+                String signOwner = null;
+                synchronized (plugin.getSignsLock()) {
+                    isVaultSign = plugin.getSigns().contains(key);
+                    if (isVaultSign) {
+                        num = plugin.getSigns().getInt(key + ".chest", 1);
+                        self = plugin.getSigns().getBoolean(key + ".self", false);
+                        signOwner = plugin.getSigns().getString(key + ".owner");
+                    }
+                }
+                if (isVaultSign) {
                     PlayerVaults.debug("Player " + player.getName() + " clicked sign at world(" + x + "," + y + "," + z + ")");
                     if (PlayerVaults.getInstance().getInVault().containsKey(player.getUniqueId().toString())) {
                         // don't let them open another vault.
                         PlayerVaults.debug("Player " + player.getName() + " denied sign vault because already in a vault!");
                         return;
                     }
-                    int num = PlayerVaults.getInstance().getSigns().getInt(world + ";;" + x + ";;" + y + ";;" + z + ".chest", 1);
                     String numS = String.valueOf(num);
                     if (player.hasPermission(Permission.SIGNS_USE) || player.hasPermission(Permission.SIGNS_BYPASS)) {
-                        boolean self = PlayerVaults.getInstance().getSigns().getBoolean(world + ";;" + x + ";;" + y + ";;" + z + ".self", false);
-                        String owner = self ? player.getName() : PlayerVaults.getInstance().getSigns().getString(world + ";;" + x + ";;" + y + ";;" + z + ".owner");
+                        String owner = self ? player.getName() : signOwner;
                         PlayerVaults.debug("Player " + player.getName() + " wants to open a " + (self ? "self" : "non-self (" + owner + ")") + " sign vault");
                         OfflinePlayer offlinePlayer = Bukkit.getOfflinePlayer(owner != null ? owner : event.getPlayer().getName()); // Not best way but :\
                         if (offlinePlayer == null || (!offlinePlayer.isOnline() && !offlinePlayer.hasPlayedBefore())) {
@@ -171,16 +186,19 @@ public class SignListener implements Listener {
      * @param location The location to check
      */
     public void blockChangeCheck(Location location) {
-        if (plugin.getSigns().getKeys(false).isEmpty()) {
-            return; // Save us a check.
-        }
-
         String world = location.getWorld().getName();
         int x = location.getBlockX();
         int y = location.getBlockY();
         int z = location.getBlockZ();
-        if (plugin.getSigns().getKeys(false).contains(world + ";;" + x + ";;" + y + ";;" + z)) {
-            plugin.getSigns().set(world + ";;" + x + ";;" + y + ";;" + z, null);
+        String key = world + ";;" + x + ";;" + y + ";;" + z;
+        boolean removed = false;
+        synchronized (plugin.getSignsLock()) {
+            if (plugin.getSigns().contains(key)) {
+                plugin.getSigns().set(key, null);
+                removed = true;
+            }
+        }
+        if (removed) {
             plugin.saveSigns();
         }
     }

@@ -19,6 +19,7 @@
 package com.drtshock.playervaults.commands;
 
 import com.drtshock.playervaults.PlayerVaults;
+import com.drtshock.playervaults.util.Scheduler;
 import com.drtshock.playervaults.vaultmanagement.VaultOperations;
 import com.drtshock.playervaults.vaultmanagement.VaultViewInfo;
 import org.bukkit.Bukkit;
@@ -70,11 +71,6 @@ public class ConsoleCommand implements CommandExecutor {
                         sender.sendMessage("FAILED TO LOOK UP UUID FOR NAME");
                         return true;
                     }
-                    if (PlayerVaults.getInstance().getInVault().containsKey(plr.getUniqueId().toString())) {
-                        // don't let them open another vault.
-                        sender.sendMessage("ALREADY HAS A VAULT OPEN: " + plr.getName());
-                        return true;
-                    }
                     int number;
                     try {
                         number = Integer.parseInt(vaultId);
@@ -82,11 +78,21 @@ public class ConsoleCommand implements CommandExecutor {
                         sender.sendMessage("NOT NUMBER");
                         return true;
                     }
-                    if (VaultOperations.openOtherVault(plr, owner, vaultId)) {
-                        PlayerVaults.getInstance().getInVault().put(plr.getUniqueId().toString(), new VaultViewInfo(owner, number));
-                    } else {
-                        sender.sendMessage("FAILED!?");
-                    }
+                    // The console runs on the global region on Folia; the inventory has to be opened
+                    // on the target player's own thread.
+                    final String vaultOwner = owner;
+                    Scheduler.runNowOrForEntity(plr, () -> {
+                        if (PlayerVaults.getInstance().getInVault().containsKey(plr.getUniqueId().toString())) {
+                            // don't let them open another vault.
+                            sender.sendMessage("ALREADY HAS A VAULT OPEN: " + plr.getName());
+                            return;
+                        }
+                        if (VaultOperations.openOtherVault(plr, vaultOwner, vaultId)) {
+                            PlayerVaults.getInstance().getInVault().put(plr.getUniqueId().toString(), new VaultViewInfo(vaultOwner, number));
+                        } else {
+                            sender.sendMessage("FAILED!?");
+                        }
+                    }, () -> sender.sendMessage("NOT ONLINE"));
                 }
             }
         }
