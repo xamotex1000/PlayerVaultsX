@@ -36,17 +36,18 @@ import com.drtshock.playervaults.tasks.Cleanup;
 import com.drtshock.playervaults.util.ComponentDispatcher;
 import com.drtshock.playervaults.util.Permission;
 import com.drtshock.playervaults.util.Scheduler;
+import com.drtshock.playervaults.util.WildcardKey;
 import com.drtshock.playervaults.vaultmanagement.EconomyOperations;
 import com.drtshock.playervaults.vaultmanagement.VaultManager;
 import com.drtshock.playervaults.vaultmanagement.VaultViewInfo;
 import com.google.gson.Gson;
-import net.kyori.adventure.audience.Audience;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.TextColor;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.Registry;
 import org.bukkit.command.Command;
@@ -107,9 +108,12 @@ public class PlayerVaults extends JavaPlugin {
     private final Map<String, Inventory> openInventories = new ConcurrentHashMap<>();
     // Replaced wholesale on reload (never mutated after publishing) so readers on other threads never see a half-built set.
     private volatile Set<Material> blockedMats = Collections.emptySet();
+    private volatile Set<WildcardKey> models = Collections.emptySet();
     private volatile Set<Enchantment> blockedEnchs = Collections.emptySet();
     private volatile boolean blockWithModelData = false;
     private volatile boolean blockWithoutModelData = false;
+    private volatile boolean blockWithModel = false;
+    private volatile boolean blockWithoutModel = false;
     private boolean useVault;
     // Guards all access to the signs config, which is read and written from many region threads on Folia.
     private final Object signsLock = new Object();
@@ -420,22 +424,38 @@ public class PlayerVaults extends JavaPlugin {
         // Build fresh sets (this may be a reload) and publish them at the end, so listeners running on
         // other threads keep using the old values until the new ones are complete.
         Set<Material> blockedMats = new HashSet<>();
+        Set<WildcardKey> models = new HashSet<>();
         Set<Enchantment> blockedEnchs = new HashSet<>();
         boolean blockWithModelData = false;
         boolean blockWithoutModelData = false;
+        boolean blockWithModel = false;
+        boolean blockWithoutModel = false;
         if (getConf().getItemBlocking().isEnabled()) {
             for (String s : getConf().getItemBlocking().getList()) {
                 if (s.equalsIgnoreCase("BLOCK_ALL_WITH_CUSTOM_MODEL_DATA")) {
                     blockWithModelData = true;
+                    continue;
                 }
                 if (s.equalsIgnoreCase("BLOCK_ALL_WITHOUT_CUSTOM_MODEL_DATA")) {
                     blockWithoutModelData = true;
+                    continue;
+                }
+                if (s.equalsIgnoreCase("BLOCK_ALL_WITH_CUSTOM_MODEL")) {
+                    blockWithModel = true;
+                    continue;
+                }
+                if (s.equalsIgnoreCase("BLOCK_ALL_WITHOUT_CUSTOM_MODEL")) {
+                    blockWithoutModel = true;
+                    continue;
                 }
                 Material mat = Material.matchMaterial(s);
                 if (mat != null) {
                     blockedMats.add(mat);
                     getLogger().log(Level.INFO, "Added {0} to list of blocked materials.", mat.name());
                 }
+            }
+            for (String s : getConf().getItemBlocking().getModelList()) {
+                models.add(WildcardKey.of(s));
             }
             boolean badEnch = false;
             for (String s : getConf().getItemBlocking().getEnchantmentsBlocked()) {
@@ -459,8 +479,11 @@ public class PlayerVaults extends JavaPlugin {
         }
         this.blockedMats = Collections.unmodifiableSet(blockedMats);
         this.blockedEnchs = Collections.unmodifiableSet(blockedEnchs);
+        this.models = Collections.unmodifiableSet(models);
         this.blockWithModelData = blockWithModelData;
         this.blockWithoutModelData = blockWithoutModelData;
+        this.blockWithModel = blockWithModel;
+        this.blockWithoutModel = blockWithoutModel;
 
         File lang = new File(this.getDataFolder(), "lang");
         if (lang.exists()) {
@@ -646,12 +669,24 @@ public class PlayerVaults extends JavaPlugin {
         return blockedMats.contains(mat);
     }
 
+    public boolean isModelMatch(NamespacedKey model) {
+        return this.models.stream().anyMatch(wcKey -> wcKey.matches(model));
+    }
+
     public boolean isBlockWithModelData() {
         return this.blockWithModelData;
     }
 
     public boolean isBlockWithoutModelData() {
         return this.blockWithoutModelData;
+    }
+
+    public boolean isBlockWithModel() {
+        return blockWithModel;
+    }
+
+    public boolean isBlockWithoutModel() {
+        return blockWithoutModel;
     }
 
     public Set<Enchantment> isEnchantmentBlocked(ItemStack item) {
